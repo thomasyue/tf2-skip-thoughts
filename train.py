@@ -1,4 +1,5 @@
 import os
+import time
 import pickle
 import datetime
 import warnings
@@ -19,10 +20,9 @@ def train():
     def compute_loss(labels, predictions):
         loss_fn = tf.keras.losses.sparse_categorical_crossentropy
         per_example_loss = loss_fn(labels, predictions, from_logits=True)
-        return tf.nn.compute_average_loss(per_example_loss, global_batch_size=global_batch_size)
+        return tf.reduce_sum(per_example_loss) * (1/global_batch_size)
 
     def train_step(inputs, optimizer):
-
         sentences, lengths = inputs
 
         with tf.GradientTape() as tape:
@@ -57,46 +57,51 @@ def train():
         return strategy.experimental_run_v2(val_step, args=(dataset_inputs,))
 
     for epoch in range(epochs):
+        start = time.time()
         total_loss = 0.0
         num_batches = 0
         total_test_loss = 0.0
         num_test_batches = 0
         total_training_steps = (total_sent - val_size) // global_batch_size
         total_testing_steps = val_size // global_batch_size
-        for step, x in tqdm(enumerate(train_dist_dataset), total=total_training_steps):
 
-            total_loss += distributed_train_step(x)
+        for step, x in tqdm(enumerate(train_dist_dataset), total=total_training_steps):
+            current_lr = lr(tf.constant(step, dtype=tf.float32))
+            current_loss = distributed_train_step(x)/max_length
+            total_loss += current_loss
             num_batches += 1
-            batch_loss = total_loss / num_batches
+
             if step % 100 == 0:
                 with train_summary_writer.as_default():
-                    tf.summary.scalar('loss', batch_loss, step=step)
-                template = ("Epoch {}, Step {}, Batch Loss: {}")
+                    tf.summary.scalar('loss', current_loss, step=step)
+                    tf.summary.scalar('lr', current_lr ,step=step)
+                template = ("Epoch {}, Step {}, Loss: {}, lr: {:.6f}")
+                print(template.format(epoch + 1, step, current_loss, current_lr))
 
-                print(template.format(epoch + 1, step, batch_loss))
             if step % 15000 == 0:
                 checkpoint.save(checkpoint_prefix)
+        try:
+            for step, x in tqdm(enumerate(val_dist_dataset), total=total_testing_steps):
+                current_test_loss = distributed_test_step(x)/max_length
+                total_test_loss += current_test_loss
+                num_test_batches += 1
 
-        for step, x in tqdm(enumerate(val_dist_dataset), total=total_testing_steps):
-            total_test_loss += distributed_test_step(x)
-            num_test_batches += 1
-            test_batch_loss = total_test_loss/num_test_batches
+                if step % 100 == 0:
+                    with test_summary_writer.as_default():
+                        tf.summary.scalar('val_loss', current_test_loss, step=step)
+                    template = ("Epoch {}, Step {}, Val Loss: {}")
 
-            if step % 100 == 0:
-                with test_summary_writer.as_default():
-                    tf.summary.scalar('val_loss', test_batch_loss, step=step)
-                template = ("Epoch {}, Step {}, Val Loss: {}")
+                    print(template.format(epoch + 1, step, current_test_loss))
+        except:
+            pass
 
-                print(template.format(epoch + 1, step, test_batch_loss))
-
-
-
-        train_loss = total_loss / num_batches
+        total_train_loss = total_loss / num_batches
+        total_test_loss = total_test_loss/num_test_batches
         if epoch % 1 == 0:
             checkpoint.save(shcekpoint_prefix)
-            template = ("Epoch {}, Total Loss: {}")
-            print(template.format(epoch + 1, train_loss))
-
+            template = ("Epoch {}, Total Train Loss: {}, Total Test Loss: {}")
+            print(template.format(epoch + 1, total_train_loss, total_test_loss))
+            print('Time taken for 1 epoch {} sec\n'.format(time.time() - start))
 
 if __name__ == "__main__":
     import argparse
@@ -109,10 +114,16 @@ if __name__ == "__main__":
                         required=True,
                         type=str,
                         metavar="choose which gpu to train on")
+    parser.add_argument('--ckpt',
+                        required=False,
+                        type=str,
+                        default='latest',
+                        metavar='specific ckpt to continue')
 
     args = parser.parse_args()
     print("Command: ", args.command)
     print("Visible GPUs: ", args.gpu)
+    print("Resume model from:", args.ckpt)
 
     os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu
 
@@ -122,22 +133,28 @@ if __name__ == "__main__":
     global_batch_size = batch_size_per_gpu * strategy.num_replicas_in_sync
     print("Global batch size: {}".format(global_batch_size))
 
-    # Load or create model
     with strategy.scope():
         model = layers.skip_thoughts(thought_size=thought_size, word_size=embed_dim, vocab_size=vocab_size,
                                      max_length=max_length)
 
-        lr = lr_schedule.CustomSchedule(16)
-        optimizer = tf.optimizers.Adam(learning_rate=lr)
+        # custom lr schedules
+        lr = lr_schedule.CustomSchedule(lr_size)
+        optimizer = tf.optimizers.Adam(learning_rate=lr, clipnorm=clip_gradient_norm)
         checkpoint = tf.train.Checkpoint(optimizer=optimizer, model=model)
 
         if args.command == 'continue':
-            ckpt_path = tf.train.latest_checkpoint(checkpoint_dir)
+            if args.ckpt == 'latest':
+                ckpt_path = tf.train.latest_checkpoint(checkpoint_dir)
+
+            else:
+                ckpt_path = os.path.join(checkpoint_dir, args.ckpt)
             print("Loading model from ", ckpt_path)
             checkpoint.restore(ckpt_path)
+
         elif args.command == 'train':
             print("Training model from scratch")
             pass
+
         else:
             print("Please enter 'train' or 'continue'!")
             print("Now Training model From scratch")

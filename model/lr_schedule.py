@@ -2,10 +2,11 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
+from config import *
 import tensorflow as tf
 
 class CustomSchedule(tf.keras.optimizers.schedules.LearningRateSchedule):
-    def __init__(self, d_model, warmup_steps=30000):
+    def __init__(self, d_model, warmup_steps=warmup_steps):
         super(CustomSchedule, self).__init__()
 
         self.d_model = d_model
